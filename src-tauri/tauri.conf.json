@@ -79,7 +79,8 @@
         "template": "nsis/installer.nsi",
         "installerIcon": "icons/icon.ico"
       }
-    }
+    },
+    "externalBin": ["binaries/handy-style-worker"]
   },
   "plugins": {
     "updater": {

@@ -240,6 +240,55 @@ async changeAutoSubmitKeySetting(key: string) : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async listStyleModels() : Promise<Result<StyleModel[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_style_models") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async downloadStyleModel(id: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("download_style_model", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async cancelStyleModelDownload() : Promise<void> {
+    await TAURI_INVOKE("cancel_style_model_download");
+},
+async deleteStyleModel(id: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_style_model", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getStyleSettings() : Promise<StyleSettings> {
+    return await TAURI_INVOKE("get_style_settings");
+},
+async setStyleSettings(settings: StyleSettings) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_style_settings", { settings }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async foregroundApp() : Promise<string | null> {
+    return await TAURI_INVOKE("foreground_app");
+},
+async listStyleApps() : Promise<Result<StyleApp[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_style_apps") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async changePostProcessEnabledSetting(enabled: boolean) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("change_post_process_enabled_setting", { enabled }) };
@@ -1015,10 +1064,8 @@ async updateRecordingRetentionPeriod(period: string) : Promise<Result<null, stri
 }
 },
 /**
- * Checks if the Mac is a laptop by detecting battery presence
- * 
- * This uses pmset to check for battery information.
- * Returns true if a battery is detected (laptop), false otherwise (desktop)
+ * Stub implementation for non-macOS platforms
+ * Always returns false since laptop detection is macOS-specific
  */
 async isLaptop() : Promise<Result<boolean, string>> {
     try {
@@ -1156,6 +1203,7 @@ export type AutoUnavailableReason =
 { kind: "no_match" }
 export type AvailableAccelerators = { transcribe: string[]; gpu_devices: GpuDeviceOption[] }
 export type BindingResponse = { success: boolean; binding: ShortcutBinding | null; error: string | null }
+export type Category = "personal" | "work" | "email" | "other"
 /**
  * Script applied to Mandarin and Cantonese output. Traditional carries its region
  * (Taiwan vs Hong Kong forms, e.g. 裡/裏) rather than guessing it.
@@ -1429,6 +1477,9 @@ export type StreamTextEvent = { committed: string; tentative: string }
  * Semantic kind of "working" phase, used to localize the spinner label.
  */
 export type StreamWorkKind = "transcribing" | "polishing"
+export type StyleApp = { id: string; name: string; aliases: string[]; suggested_category: Category | null }
+export type StyleModel = { id: string; name: string; size: number; downloaded: boolean }
+export type StyleSettings = { enabled: boolean; model_id: string; default_category: Category; categories: Partial<{ [key in Category]: WritingStyle }>; apps: Partial<{ [key in string]: Category }>; app_aliases: Partial<{ [key in string]: string }>; custom_prompts: Partial<{ [key in Category]: string }> }
 /**
  * UI appearance mode. `System` follows the OS `prefers-color-scheme`; `Light`
  * and `Dark` force one of the two palettes Handy already ships.
@@ -1479,6 +1530,7 @@ export type TranscriptionOutcome =
 export type TypingTool = "auto" | "wtype" | "kwtype" | "dotool" | "ydotool" | "xdotool"
 export type VadBackend = "silero" | "earshot"
 export type WindowsMicrophonePermissionStatus = { supported: boolean; overall_access: PermissionAccess; device_access: PermissionAccess; app_access: PermissionAccess; desktop_app_access: PermissionAccess }
+export type WritingStyle = "formal" | "casual" | "very_casual"
 
 /** tauri-specta globals **/
 

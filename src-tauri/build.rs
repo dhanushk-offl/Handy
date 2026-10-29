@@ -3,6 +3,7 @@ fn main() {
     build_apple_intelligence_bridge();
 
     generate_tray_translations();
+    build_style_worker();
 
     // Linux ships transcribe-cpp as a shared libtranscribe + loadable ggml
     // backend modules (the `dynamic-backends` posture in Cargo.toml). Bake an
@@ -37,6 +38,58 @@ fn main() {
     stage_vc_runtime_dlls();
 
     tauri_build::build()
+}
+
+/// Build the isolated local text engine separately so its ggml symbols cannot
+/// collide with the speech engine's native libraries.
+fn build_style_worker() {
+    use std::path::Path;
+    use std::process::Command;
+
+    for path in [
+        "style-worker/Cargo.toml",
+        "style-worker/Cargo.lock",
+        "style-worker/src/main.rs",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    let target = std::env::var("TARGET").expect("Cargo sets TARGET");
+    let release = std::env::var("PROFILE").as_deref() == Ok("release");
+    let cargo = std::env::var_os("CARGO").expect("Cargo sets CARGO");
+    let mut cmd = Command::new(cargo);
+    cmd.args([
+        "build",
+        "--locked",
+        "--manifest-path",
+        "style-worker/Cargo.toml",
+        "--target",
+        &target,
+        "--target-dir",
+        "style-worker/target",
+    ])
+    .env_remove("CARGO_TARGET_DIR");
+    if release {
+        cmd.arg("--release");
+    }
+    assert!(
+        cmd.status()
+            .expect("failed to start style worker build")
+            .success(),
+        "style worker build failed"
+    );
+    let extension = if target.contains("windows") {
+        ".exe"
+    } else {
+        ""
+    };
+    let profile = if release { "release" } else { "debug" };
+    let source = Path::new("style-worker/target")
+        .join(&target)
+        .join(profile)
+        .join(format!("handy-style-worker{extension}"));
+    std::fs::create_dir_all("binaries").expect("create sidecar directory");
+    let destination = Path::new("binaries").join(format!("handy-style-worker-{target}{extension}"));
+    std::fs::copy(source, destination).expect("stage style worker");
 }
 
 /// Link clang's compiler runtime, which provides `__isPlatformVersionAtLeast`.

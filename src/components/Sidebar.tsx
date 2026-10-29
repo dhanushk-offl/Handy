@@ -1,6 +1,7 @@
 import React from "react";
 import { useTranslation } from "react-i18next";
 import { Cog, FlaskConical, History, Info, Sparkles, Cpu } from "lucide-react";
+import { StylesSettings } from "./settings/styles/StylesSettings";
 import HandyTextLogo from "./icons/HandyTextLogo";
 import HandyHand from "./icons/HandyHand";
 import { useSettings } from "../hooks/useSettings";
@@ -22,6 +23,23 @@ interface IconProps {
   className?: string;
   [key: string]: any;
 }
+
+const StylesIcon: React.FC<IconProps> = ({ size = 24, ...props }) => (
+  <svg
+    {...props}
+    width={props.width ?? size}
+    height={props.height ?? size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    aria-hidden="true"
+  >
+    <path d="M3 5h12M9 5v14M6 19h6M16 10h6M19 7v10a2 2 0 0 0 2 2h1" />
+  </svg>
+);
 
 interface SectionConfig {
   labelKey: string;
@@ -48,6 +66,12 @@ export const SECTIONS_CONFIG = {
     labelKey: "sidebar.models",
     icon: Cpu,
     component: ModelsSettings,
+    enabled: () => true,
+  },
+  styles: {
+    labelKey: "styles.title",
+    icon: StylesIcon,
+    component: StylesSettings,
     enabled: () => true,
   },
   advanced: {

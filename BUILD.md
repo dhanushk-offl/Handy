@@ -93,6 +93,10 @@ bun install
 bun tauri dev
 ```
 
+The first Rust build also builds Handy's isolated local style worker and can take
+several minutes. The worker is built automatically; style models are downloaded
+separately through the Styles settings.
+
 ### 4. Build for Production
 
 ```bash

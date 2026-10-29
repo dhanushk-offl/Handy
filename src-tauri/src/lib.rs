@@ -13,6 +13,8 @@ pub mod engine_supervisor;
 mod helpers;
 mod input;
 mod language_detection;
+#[cfg(target_os = "linux")]
+mod linux_foreground;
 mod llm_client;
 mod managers;
 mod memory;
@@ -23,6 +25,9 @@ mod secure_input;
 mod settings;
 mod shortcut;
 mod signal_handle;
+mod style_apps;
+mod style_models;
+mod styles;
 mod system_languages;
 mod transcription_coordinator;
 mod tray;
@@ -686,6 +691,14 @@ pub fn run(cli_args: CliArgs) {
             shortcut::change_clipboard_handling_setting,
             shortcut::change_auto_submit_setting,
             shortcut::change_auto_submit_key_setting,
+            style_models::list_style_models,
+            style_models::download_style_model,
+            style_models::cancel_style_model_download,
+            style_models::delete_style_model,
+            styles::get_style_settings,
+            styles::set_style_settings,
+            styles::foreground_app,
+            style_apps::list_style_apps,
             shortcut::change_post_process_enabled_setting,
             shortcut::change_experimental_enabled_setting,
             shortcut::change_post_process_base_url_setting,

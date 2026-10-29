@@ -48,6 +48,9 @@ The process is entirely local:
 4. Configure your preferred keyboard shortcuts in Settings
 5. Start transcribing!
 
+To refine dictation locally and apply different writing styles to apps, see the
+[Styles guide](docs/styles/README.md).
+
 ### Development Setup
 
 For detailed build instructions including platform-specific requirements, see [BUILD.md](BUILD.md).

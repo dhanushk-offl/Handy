@@ -175,7 +175,11 @@ fn should_use_streaming_overlay(style: OverlayStyle, is_streaming: bool) -> bool
     style == OverlayStyle::Live && is_streaming
 }
 
-async fn post_process_transcription(settings: &AppSettings, transcription: &str) -> Option<String> {
+async fn post_process_transcription(
+    settings: &AppSettings,
+    transcription: &str,
+    strict: bool,
+) -> Option<String> {
     if is_blank_transcription(transcription) {
         debug!("Post-processing skipped because the transcription is empty");
         return None;
@@ -265,12 +269,16 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                 }
 
                 let token_limit = model.trim().parse::<i32>().unwrap_or(0);
-                return match apple_intelligence::process_text_with_system_prompt(
-                    &system_prompt,
-                    &user_content,
-                    token_limit,
-                ) {
-                    Ok(result) => {
+                let apple_result = tokio::task::spawn_blocking(move || {
+                    apple_intelligence::process_text_with_system_prompt(
+                        &system_prompt,
+                        &user_content,
+                        token_limit,
+                    )
+                })
+                .await;
+                return match apple_result {
+                    Ok(Ok(result)) => {
                         if result.trim().is_empty() {
                             debug!("Apple Intelligence returned an empty response");
                             None
@@ -283,8 +291,12 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                             Some(result)
                         }
                     }
-                    Err(err) => {
+                    Ok(Err(err)) => {
                         error!("Apple Intelligence post-processing failed: {}", err);
+                        None
+                    }
+                    Err(err) => {
+                        error!("Apple Intelligence task failed: {}", err);
                         None
                     }
                 };
@@ -335,10 +347,18 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                                 provider.id,
                                 result.len()
                             );
-                            return Some(result);
+                            return if strict && result.trim().is_empty() {
+                                None
+                            } else {
+                                Some(result)
+                            };
                         } else {
                             error!("Structured output response missing 'transcription' field");
-                            return Some(strip_invisible_chars(content));
+                            return if strict {
+                                None
+                            } else {
+                                Some(strip_invisible_chars(content))
+                            };
                         }
                     }
                     Err(e) => {
@@ -346,7 +366,11 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                             "Failed to parse structured output JSON: {}. Returning raw content.",
                             e
                         );
-                        return Some(strip_invisible_chars(content));
+                        return if strict {
+                            None
+                        } else {
+                            Some(strip_invisible_chars(content))
+                        };
                     }
                 }
             }
@@ -355,6 +379,13 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                 return None;
             }
             Err(e) => {
+                if strict {
+                    warn!(
+                        "Structured style output failed for provider '{}': {}",
+                        provider.id, e
+                    );
+                    return None;
+                }
                 warn!(
                     "Structured output failed for provider '{}': {}. Falling back to legacy mode.",
                     provider.id, e
@@ -362,6 +393,31 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                 // Fall through to legacy mode below
             }
         }
+    }
+
+    // Style prompts use a separate system message whenever the endpoint supports it.
+    if strict {
+        return match crate::llm_client::send_chat_completion_with_schema(
+            &provider,
+            api_key,
+            &model,
+            transcription.to_string(),
+            Some(build_system_prompt(&prompt)),
+            None,
+            disable_reasoning,
+        )
+        .await
+        {
+            Ok(Some(content)) => {
+                let content = strip_invisible_chars(strip_think_block(&content));
+                if content.trim().is_empty() {
+                    None
+                } else {
+                    Some(content)
+                }
+            }
+            _ => None,
+        };
     }
 
     // Legacy mode: Replace ${output} variable in the prompt with the actual text
@@ -384,7 +440,11 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                 provider.id,
                 content.len()
             );
-            Some(content)
+            if strict && content.trim().is_empty() {
+                None
+            } else {
+                Some(content)
+            }
         }
         Ok(None) => {
             error!("LLM API response has no content");
@@ -418,7 +478,9 @@ pub(crate) async fn process_transcription_output(
     let mut post_process_prompt: Option<String> = None;
 
     if post_process {
-        if let Some(processed_text) = post_process_transcription(&settings, &final_text).await {
+        if let Some(processed_text) =
+            post_process_transcription(&settings, &final_text, false).await
+        {
             post_processed_text = Some(processed_text.clone());
             final_text = processed_text;
 
@@ -438,6 +500,331 @@ pub(crate) async fn process_transcription_output(
         final_text,
         post_processed_text,
         post_process_prompt,
+    }
+}
+
+/// Resolve only adjacent, explicit clock-time corrections before editing. Other
+/// corrections are left to the model because their intent is ambiguous.
+fn resolve_explicit_time_corrections(text: &str) -> String {
+    static TIME_CORRECTION: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(
+        r"(?i)\b(?P<old>\d{1,2}(?:[:.]\d{2})?\s*[ap]\.?m\b\.?)\s*(?P<separator>[,.;!?—-])?\s*(?:sorry|actually|no)\s*,?\s*(?:it(?:'|’)s\s+|it\s+is\s+)?(?P<new>\d{1,2}(?:[:.]\d{2})?\s*[ap]\.?m\b\.?)"
+    ).expect("valid time correction regex")
+    });
+    fn valid_time(time: &str) -> bool {
+        let number = time
+            .trim()
+            .split(|c: char| c.is_ascii_alphabetic())
+            .next()
+            .unwrap_or("")
+            .trim();
+        let mut parts = number.split([':', '.']);
+        let hour = parts.next().and_then(|part| part.parse::<u32>().ok());
+        let minute = parts.next().map(|part| part.parse::<u32>().ok());
+        matches!(hour, Some(1..=12))
+            && minute.is_none_or(|m| matches!(m, Some(0..=59)))
+            && parts.next().is_none()
+    }
+    TIME_CORRECTION
+        .replace_all(text, |caps: &regex::Captures<'_>| {
+            if valid_time(&caps["old"]) && valid_time(&caps["new"]) {
+                let mut result = caps["new"].to_string();
+                if let Some(separator) = caps.name("separator") {
+                    if matches!(separator.as_str(), "?" | "!") {
+                        // A period after the corrected time ends the correction,
+                        // while the original question/exclamation carries its intent.
+                        if result.ends_with('.') {
+                            result.pop();
+                        }
+                        result.push_str(separator.as_str());
+                    }
+                }
+                result
+            } else {
+                caps[0].to_string()
+            }
+        })
+        .into_owned()
+}
+
+/// Preserve numeric details in the prepared transcript when accepting an edit.
+fn preserves_numbers(input: &str, output: &str) -> bool {
+    static CLOCK_VALUES: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r"(?i)\b(\d{1,2})(?:[:.](\d{2}))?\s*([ap])\.?m\b")
+            .expect("valid clock value regex")
+    });
+    static CLOCK: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r"(?i)\b(\d{1,2})[.:](\d{2})\s*([ap])\.?m\b").expect("valid clock regex")
+    });
+    static NUMBERS: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"[0-9]+(?:[.:,][0-9]+)*").expect("valid number regex"));
+    let clocks = |text: &str| {
+        CLOCK_VALUES
+            .captures_iter(text)
+            .map(|c| {
+                (
+                    c[1].parse::<u32>().ok(),
+                    c.get(2).map(|m| m.as_str()).unwrap_or("00").to_string(),
+                    c[3].to_ascii_lowercase(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    if clocks(input) != clocks(output) {
+        return false;
+    }
+    let input = CLOCK.replace_all(input, "${1}:${2} ${3}m");
+    let output = CLOCK.replace_all(output, "${1}:${2} ${3}m");
+    NUMBERS
+        .find_iter(&input)
+        .map(|m| m.as_str())
+        .eq(NUMBERS.find_iter(&output).map(|m| m.as_str()))
+}
+
+/// Identify tokens whose casing or punctuation can carry technical meaning.
+fn is_technical_token(token: &str) -> bool {
+    if token.chars().any(|c| {
+        matches!(
+            c,
+            '/' | '\\'
+                | '_'
+                | '@'
+                | '#'
+                | '='
+                | '`'
+                | '"'
+                | '<'
+                | '>'
+                | '$'
+                | '&'
+                | '|'
+                | '+'
+                | '*'
+                | '%'
+                | '~'
+                | '^'
+        )
+    }) || token.contains("--")
+        || token.contains("::")
+    {
+        return true;
+    }
+    let letters: Vec<char> = token.chars().filter(|c| c.is_alphabetic()).collect();
+    if letters.len() > 1 && letters.iter().all(|c| c.is_uppercase()) {
+        return true;
+    }
+    if letters.iter().skip(1).any(|c| c.is_uppercase()) {
+        return true;
+    }
+    let chars: Vec<char> = token.chars().collect();
+    chars.windows(3).any(|w| {
+        w[1] == '.'
+            && w[0].is_alphanumeric()
+            && w[2].is_alphanumeric()
+            && !(w[0].is_ascii_digit() && w[2].is_ascii_digit())
+    })
+}
+
+fn preserves_technical_tokens(input: &str, output: &str) -> bool {
+    input
+        .split_whitespace()
+        .filter(|word| is_technical_token(word))
+        .all(|word| {
+            let token = word
+                .trim_matches(|c: char| matches!(c, ',' | ';' | '!' | '?' | '(' | ')' | '[' | ']'));
+            token.is_empty() || output.contains(token)
+        })
+}
+
+/// Avoid changing plain-looking command words when dictating into a terminal.
+fn likely_technical_text(text: &str) -> bool {
+    let first = text
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let command = [
+        "git", "cargo", "npm", "npx", "bun", "node", "python", "python3", "pip", "cd", "ls", "pwd",
+        "echo", "sudo", "curl", "docker", "kubectl", "make", "grep", "rg", "cat", "rm", "mkdir",
+        "touch", "export",
+    ]
+    .contains(&first.as_str());
+    command || text.split_whitespace().any(is_technical_token)
+}
+
+/// Lowercase ordinary text while preserving the model's light punctuation.
+fn very_casual_format(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for token in text.split_inclusive(char::is_whitespace) {
+        if is_technical_token(token) {
+            output.push_str(token);
+        } else {
+            output.extend(token.chars().flat_map(char::to_lowercase));
+        }
+    }
+    output
+}
+
+/// Ensure ordinary formal text starts with a capital and ends with punctuation.
+fn formal_format(text: &str) -> String {
+    let text = text.trim();
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut result: String = first.to_uppercase().chain(chars).collect();
+    if result.chars().last().is_some_and(char::is_alphanumeric) {
+        result.push('.');
+    }
+    result
+}
+
+/// Build model-specific input without exposing control tokens to other models.
+fn style_model_input(model_id: &str, transcription: &str) -> String {
+    if model_id == "qwen3" {
+        format!("{transcription}\n/no_think")
+    } else {
+        transcription.to_string()
+    }
+}
+
+/// Never paste model control tokens or an echoed request as a styled result.
+fn clean_style_output(output: &str, transcription: &str) -> Option<String> {
+    let mut text = strip_invisible_chars(strip_think_block(output))
+        .trim()
+        .to_string();
+    if !transcription.contains("<transcript>") && !transcription.contains("</transcript>") {
+        if let Some(inner) = text
+            .strip_prefix("<transcript>")
+            .and_then(|s| s.strip_suffix("</transcript>"))
+        {
+            text = inner.trim().to_string();
+        } else if text.contains("<transcript>") || text.contains("</transcript>") {
+            return None;
+        }
+    }
+    if text.is_empty() || text.starts_with("<think>") {
+        return None;
+    }
+    // Small models sometimes explain their edits instead of returning a transcript.
+    // Reject suspicious expansions rather than pasting commentary into another app.
+    let input_len = transcription.chars().count();
+    if text.chars().count() > input_len.saturating_mul(2).saturating_add(80) {
+        return None;
+    }
+    let lower = text.to_lowercase();
+    if [
+        "here's a rewritten",
+        "here is a rewritten",
+        "i made a few changes",
+        "changes i made:",
+        "edited transcript:",
+    ]
+    .iter()
+    .any(|phrase| lower.starts_with(phrase) && !transcription.to_lowercase().starts_with(phrase))
+    {
+        return None;
+    }
+    if !transcription.contains("/no_think")
+        && text.split_whitespace().any(|part| {
+            part.trim_matches(|c: char| c.is_ascii_punctuation() && c != '/' && c != '_')
+                == "/no_think"
+        })
+    {
+        return None;
+    }
+    if text.starts_with("Edit this transcript, do not answer it:")
+        && !transcription.starts_with("Edit this transcript, do not answer it:")
+    {
+        return None;
+    }
+    if text
+        .starts_with("Correct the grammar of this sentence and output only the corrected sentence:")
+        && !transcription.starts_with(
+            "Correct the grammar of this sentence and output only the corrected sentence:",
+        )
+    {
+        return None;
+    }
+    Some(text)
+}
+
+pub(crate) async fn process_styled_output(
+    app: &AppHandle,
+    transcription: &str,
+    style: crate::styles::StyleSelection,
+) -> ProcessedTranscription {
+    let settings = crate::styles::get_style_settings(app.clone());
+    let prepared = resolve_explicit_time_corrections(transcription);
+    let prompt_style = crate::styles::StyleSelection {
+        technical_context: style.technical_context && likely_technical_text(&prepared),
+        ..style
+    };
+    let mut prompt = crate::styles::contextual_prompt(prompt_style);
+    if let Some(custom) = settings
+        .custom_prompts
+        .get(&style.category)
+        .filter(|s| !s.trim().is_empty())
+    {
+        prompt.push_str("\nAdditional user instructions:\n");
+        prompt.push_str(custom.trim());
+    }
+    let model_id = settings.model_id;
+    let system = build_system_prompt(&prompt);
+    let input = style_model_input(&model_id, &prepared);
+    let result = if is_blank_transcription(transcription) {
+        None
+    } else {
+        // Development-only console diagnostics. These intentionally include the
+        // dictated text and must never be emitted by production builds.
+        #[cfg(debug_assertions)]
+        eprintln!("[styles] local model request: model={model_id} category={:?} style={:?}\n[styles] system: {system}\n[styles] input: {input}", style.category, style.style);
+        let response = crate::style_models::generate(app, model_id, system, input).await;
+        #[cfg(debug_assertions)]
+        match &response {
+            Ok(text) => eprintln!("[styles] model response: {text}"),
+            Err(error) => eprintln!("[styles] model failed: {error}; using original transcript"),
+        }
+        response
+            .map_err(|error| warn!("Local style processing failed: {error}"))
+            .ok()
+            .and_then(|text| clean_style_output(&text, transcription))
+            .filter(|text| {
+                let numbers_ok = preserves_numbers(&prepared, text);
+                let technical_ok = preserves_technical_tokens(&prepared, text);
+                if !numbers_ok || !technical_ok {
+                    debug!("Style output rejected: numbers_preserved={numbers_ok}, technical_tokens_preserved={technical_ok}");
+                    #[cfg(debug_assertions)]
+                    eprintln!("[styles] rejected: numbers_preserved={numbers_ok} technical_tokens_preserved={technical_ok}");
+                }
+                numbers_ok && technical_ok
+            })
+            .map(|text| {
+                if style.technical_context && likely_technical_text(&prepared) {
+                    return text;
+                }
+                match style.style {
+                    crate::styles::WritingStyle::VeryCasual => very_casual_format(&text),
+                    crate::styles::WritingStyle::Formal if !likely_technical_text(&prepared) => formal_format(&text),
+                    _ => text,
+                }
+            })
+            .filter(|text| !text.trim().is_empty())
+    };
+    #[cfg(debug_assertions)]
+    if let Some(text) = &result {
+        eprintln!("[styles] final styled output: {text}");
+    }
+    if result.is_none() && !is_blank_transcription(transcription) {
+        #[cfg(debug_assertions)]
+        eprintln!("[styles] no usable styled output; using original transcript");
+        warn!("Style processing failed; using original transcription");
+        let _ = app.emit("style-processing-skipped", ());
+    }
+    ProcessedTranscription {
+        final_text: result.clone().unwrap_or_else(|| transcription.to_string()),
+        post_processed_text: result.clone(),
+        post_process_prompt: Some(crate::styles::history_selection(style, &prompt)),
     }
 }
 
@@ -474,6 +861,7 @@ impl ShortcutAction for TranscribeAction {
             }
         }
 
+        crate::styles::capture(app, self.post_process);
         let binding_id = binding_id.to_string();
         RECORDING_SESSION.fetch_add(1, Ordering::SeqCst);
         let tray_started = Instant::now();
@@ -659,6 +1047,7 @@ impl ShortcutAction for TranscribeAction {
 
         let binding_id = binding_id.to_string(); // Clone binding_id for the async task
         let post_process = self.post_process;
+        let writing_style = crate::styles::take();
         let cancel_generation = rm.cancel_generation();
 
         tauri::async_runtime::spawn(async move {
@@ -755,7 +1144,7 @@ impl ShortcutAction for TranscribeAction {
                                 utils::redact_text(&transcription)
                             );
 
-                            if post_process {
+                            if post_process || writing_style.is_some() {
                                 if use_streaming_overlay {
                                     tm.emit_stream_working(StreamWorkKind::Polishing);
                                 } else {
@@ -763,7 +1152,18 @@ impl ShortcutAction for TranscribeAction {
                                 }
                             }
                             let Some(processed) = complete_unless_cancelled(
-                                process_transcription_output(&ah, &transcription, post_process),
+                                async {
+                                    if let Some(style) = writing_style {
+                                        process_styled_output(&ah, &transcription, style).await
+                                    } else {
+                                        process_transcription_output(
+                                            &ah,
+                                            &transcription,
+                                            post_process,
+                                        )
+                                        .await
+                                    }
+                                },
                                 || rm.was_cancelled_since(cancel_generation),
                             )
                             .await
@@ -786,7 +1186,7 @@ impl ShortcutAction for TranscribeAction {
                                 if let Err(err) = hm.save_entry(
                                     file_name,
                                     transcription,
-                                    post_process,
+                                    post_process || writing_style.is_some(),
                                     processed.post_processed_text.clone(),
                                     processed.post_process_prompt.clone(),
                                     language,
@@ -988,8 +1388,10 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_unless_cancelled, is_blank_transcription, should_use_streaming_overlay,
-        strip_think_block,
+        clean_style_output, complete_unless_cancelled, formal_format, is_blank_transcription,
+        likely_technical_text, preserves_numbers, preserves_technical_tokens,
+        resolve_explicit_time_corrections, should_use_streaming_overlay, strip_think_block,
+        style_model_input, very_casual_format,
     };
     use crate::settings::OverlayStyle;
     use std::future;
@@ -997,6 +1399,151 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn removes_model_wrapper_without_destroying_literal_markup() {
+        assert_eq!(
+            clean_style_output("<transcript>Hello.</transcript>", "Hello.").as_deref(),
+            Some("Hello.")
+        );
+        assert_eq!(clean_style_output("<transcript>Hello", "Hello"), None);
+        assert_eq!(
+            clean_style_output(
+                "<transcript>Hello</transcript>",
+                "<transcript>Hello</transcript>"
+            )
+            .as_deref(),
+            Some("<transcript>Hello</transcript>")
+        );
+    }
+
+    #[test]
+    fn corrects_only_clear_adjacent_clock_repairs() {
+        let input = "Plan the call around 7pm. No, it's 8pm. Discuss with Jane.";
+        assert_eq!(
+            resolve_explicit_time_corrections(input),
+            "Plan the call around 8pm. Discuss with Jane."
+        );
+        assert_eq!(
+            resolve_explicit_time_corrections("Meet at 7pm or 8pm."),
+            "Meet at 7pm or 8pm."
+        );
+        assert_eq!(
+            resolve_explicit_time_corrections("Meet at 27pm. No, it's 8pm."),
+            "Meet at 27pm. No, it's 8pm."
+        );
+        assert!(preserves_numbers("Meet at 8pm.", "meet at 8 pm"));
+        assert!(!preserves_numbers("Meet at 8pm.", "meet at 7pm"));
+        let reported = "Hey Zahangir, can we have a quick call by today evening 7pm? Sorry, 7.30pm";
+        let prepared = resolve_explicit_time_corrections(reported);
+        assert_eq!(
+            prepared,
+            "Hey Zahangir, can we have a quick call by today evening 7.30pm?"
+        );
+        let model = "Hey Zahangir, can we have a quick call by today evening at 7:30 PM?";
+        assert!(preserves_numbers(&prepared, model));
+        assert_eq!(
+            resolve_explicit_time_corrections(
+                "Hey guys, can we have a quick call around 7.30pm? Sorry, 8pm."
+            ),
+            "Hey guys, can we have a quick call around 8pm?"
+        );
+        assert!(!preserves_numbers(&prepared, "Meet at 7:45 PM?"));
+        assert!(!preserves_numbers(&prepared, "Meet at 7:30 AM?"));
+        assert!(!preserves_numbers("Version 7.30", "Version 7:30"));
+    }
+
+    #[test]
+    fn very_casual_preserves_technical_tokens() {
+        assert_eq!(
+            very_casual_format("Today, meet Jane at 8pm. Is it ready?"),
+            "today, meet jane at 8pm. is it ready?"
+        );
+        assert_eq!(
+            very_casual_format("Use API_KEY and https://example.com/Foo. at 8:30, version 3.14."),
+            "use API_KEY and https://example.com/Foo. at 8:30, version 3.14."
+        );
+        assert_eq!(
+            very_casual_format("Run FooBar and API now!"),
+            "run FooBar and API now!"
+        );
+        assert_eq!(
+            very_casual_format("Use C++ and FooBar!"),
+            "use C++ and FooBar!"
+        );
+        assert!(preserves_technical_tokens("Use API_KEY", "use API_KEY"));
+        assert!(!preserves_technical_tokens("Use API_KEY", "use api_key"));
+        assert!(likely_technical_text("git status;"));
+        assert!(likely_technical_text("run FooBar"));
+        assert!(!likely_technical_text("Today I need to meet Jane at 8pm."));
+    }
+
+    #[test]
+    fn formal_style_capitalizes_and_punctuates_plain_text() {
+        assert_eq!(formal_format("hello everyone"), "Hello everyone.");
+        assert_eq!(formal_format("can we meet?"), "Can we meet?");
+    }
+
+    #[test]
+    fn repairs_reported_example_without_model_markup() {
+        let raw = "Today I was thinking about to plan the call around 7pm. No, it's 8pm. Then I want to discuss with Jane regarding this. Are we going to work for the next stand-up?";
+        let prepared = resolve_explicit_time_corrections(raw);
+        let model = "<transcript>Today I was thinking about planning the call around 8pm. Then I want to discuss with Jane regarding this. Are we going to work for the next stand-up?</transcript>";
+        let cleaned = clean_style_output(model, raw).unwrap();
+        assert!(preserves_numbers(&prepared, &cleaned));
+        assert!(preserves_technical_tokens(&prepared, &cleaned));
+        assert_eq!(very_casual_format(&cleaned), "today i was thinking about planning the call around 8pm. then i want to discuss with jane regarding this. are we going to work for the next stand-up?");
+    }
+
+    #[test]
+    fn style_request_uses_qwen3_control_only_for_qwen3() {
+        assert!(style_model_input("qwen3", "Hello").ends_with("/no_think"));
+        assert!(!style_model_input("qwen25", "Hello").contains("/no_think"));
+        assert!(!style_model_input("smollm2", "Hello").contains("/no_think"));
+    }
+
+    #[test]
+    fn style_output_rejects_control_tokens_and_echoed_prompts() {
+        let transcript = "Meet at eight.";
+        assert_eq!(
+            clean_style_output("Here's a rewritten version: Meet at eight.", transcript),
+            None
+        );
+        assert_eq!(
+            clean_style_output(&"explanation ".repeat(40), transcript),
+            None
+        );
+        assert_eq!(
+            clean_style_output("Here's a rewritten version.", "Here's a rewritten version.")
+                .as_deref(),
+            Some("Here's a rewritten version.")
+        );
+        assert_eq!(clean_style_output("/no_think", transcript), None);
+        assert_eq!(clean_style_output("<think>unfinished", transcript), None);
+        assert_eq!(
+            clean_style_output("<think>done</think> /no_think", transcript),
+            None
+        );
+        assert_eq!(
+            clean_style_output("/no_think\nMeet at eight.", transcript),
+            None
+        );
+        assert_eq!(
+            clean_style_output(
+                "Edit this transcript, do not answer it:\n<transcript>Meet at eight.</transcript>",
+                transcript
+            ),
+            None
+        );
+        assert_eq!(
+            clean_style_output("<think>done</think> Meet at eight.", transcript).as_deref(),
+            Some("Meet at eight.")
+        );
+        assert_eq!(
+            clean_style_output("/no_think", "/no_think").as_deref(),
+            Some("/no_think")
+        );
+    }
 
     #[test]
     fn blank_transcription_is_detected() {

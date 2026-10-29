@@ -307,11 +307,17 @@ impl TranscriptionJobManager {
             return Ok(());
         }
 
-        let processed = tauri::async_runtime::block_on(process_transcription_output(
-            &self.app,
-            &text,
-            entry.post_process_requested,
-        ));
+        let style = entry
+            .post_process_prompt
+            .as_deref()
+            .and_then(crate::styles::selection_from_prompt);
+        let processed = tauri::async_runtime::block_on(async {
+            if let Some(style) = style {
+                crate::actions::process_styled_output(&self.app, &text, style).await
+            } else {
+                process_transcription_output(&self.app, &text, entry.post_process_requested).await
+            }
+        });
         // Post-processing can take a while; a cancel during it still wins.
         if cancelled.load(Ordering::Acquire) {
             return Ok(());
